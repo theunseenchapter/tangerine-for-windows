@@ -4,34 +4,37 @@
 <title>FlowDrop</title><link rel="stylesheet" href="styles.css"></head>
 <body>
 <div class="titlebar" id="titlebar">
-  <div class="brand"><span class="brand-mark"><i data-icon="logo"></i></span><span class="brand-name">FlowDrop</span></div>
+  <div class="window-caption"><span class="brand-mark"><i data-icon="logo"></i></span><span class="brand-name">FlowDrop</span><span class="caption-dot"></span><span>Image workspace</span></div>
 </div>
 <div class="shell">
   <nav class="sidebar" aria-label="Primary">
-    <button class="nav active" data-view="convert" aria-current="page"><i data-icon="convert"></i><span>Convert</span></button>
-    <button class="nav" data-view="settings"><i data-icon="settings"></i><span>Settings</span></button>
-    <div class="side-note"><i data-icon="lock"></i><span>Files never leave this PC</span></div>
+    <div class="sidebar-brand"><span class="brand-mark large"><i data-icon="logo"></i></span><div><b>FlowDrop</b><small>Local image studio</small></div></div>
+    <div class="nav-label">Workspace</div>
+    <button class="nav active" data-view="convert" aria-current="page"><i data-icon="convert"></i><span>Convert</span><kbd>⌘ 1</kbd></button>
+    <button class="nav" data-view="settings"><i data-icon="settings"></i><span>Settings</span><kbd>⌘ ,</kbd></button>
+    <div class="sidebar-bottom"><div class="side-note"><i data-icon="lock"></i><span><b>Private by default</b><small>Nothing leaves this PC</small></span></div><div class="version">FLOWDROP <span>0.1</span></div></div>
   </nav>
 
   <main class="panel">
     <section class="view active" id="view-convert" aria-label="Convert files">
-      <div class="view-head"><h1>Convert</h1><p>Drop images, pick a format, done. Everything runs locally.</p></div>
+      <div class="workspace-head"><div><div class="eyebrow"><span class="eyebrow-dot"></span> Local workflow <span class="eyebrow-line"></span> Ready when you are</div><h1>Make every pixel<br><em>move better.</em></h1><p>Convert, compress, and keep your images exactly where they belong.</p></div><div class="head-mark">FD<span>↗</span></div></div>
+      <div class="metric-row" aria-label="FlowDrop benefits"><div><strong>100%</strong><span>Offline</span></div><div><strong>0</strong><span>Uploads</span></div><div><strong>10+</strong><span>Input types</span></div><div class="metric-note"><i data-icon="check"></i> Originals stay untouched</div></div>
 
       <div class="dropzone" id="dropzone" tabindex="0" role="button" aria-label="Add files. Drop here or press Enter to browse">
-        <div class="dz-icon"><i data-icon="upload"></i></div>
-        <div class="dz-copy"><h2>Drop images here</h2><p>or <span class="link">browse your PC</span></p></div>
-        <div class="chips" aria-hidden="true"><span>JPG</span><span>PNG</span><span>WEBP</span><span>AVIF</span><span>TIFF</span></div>
+        <div class="drop-orbit"><div class="dz-icon"><i data-icon="upload"></i></div></div>
+        <div class="dz-copy"><h2>Drop your images here</h2><p>or <span class="link">choose files from your PC</span></p></div>
+        <div class="chips" aria-hidden="true"><span>JPG</span><span>PNG</span><span>WEBP</span><span>AVIF</span><span>TIFF</span><span>+ more</span></div>
       </div>
 
       <div class="list-head" id="listHead" hidden>
-        <h3>Files <span class="count" id="fileCount">0</span></h3>
-        <button class="btn ghost sm" id="clear"><i data-icon="trash"></i>Clear all</button>
+        <h3><span class="section-kicker">Queue</span> Files <span class="count" id="fileCount">0</span></h3>
+        <button class="btn ghost sm" id="clear"><i data-icon="trash"></i>Clear queue</button>
       </div>
       <div class="file-list" id="fileList" role="list"></div>
 
       <div class="action-bar">
         <div class="action-row">
-          <span class="label" id="fmtLabel">Convert to</span>
+          <span class="label" id="fmtLabel"><span class="section-kicker">Output</span> Choose a format</span>
           <label class="select"><span class="sr">Image quality</span>
             <select id="quality"><option value="92">High · 92%</option><option value="88" selected>Balanced · 88%</option><option value="72">Smaller · 72%</option></select>
             <i data-icon="chevron"></i></label>
@@ -44,12 +47,12 @@
           <button class="format" role="radio" data-format="tiff"><strong>TIFF</strong><small>Print workflow</small></button>
         </div>
         <button class="btn primary lg" id="convert" disabled><span class="fill"></span><span class="btn-label"><i data-icon="convert"></i><span id="convertText">Convert</span></span></button>
-        <p class="hint">Copies are saved beside the originals. Originals are never overwritten.</p>
+        <p class="hint"><i data-icon="lock"></i> Copies are saved beside the originals. Originals are never overwritten.</p>
       </div>
     </section>
 
     <section class="view" id="view-settings" aria-label="Settings">
-      <div class="view-head"><h1>Settings</h1><p>Preferences are saved on this device.</p></div>
+      <div class="view-head"><div class="eyebrow"><span class="eyebrow-dot"></span> Control room</div><h1>Settings</h1><p>Shape FlowDrop around the way you work. Preferences stay on this device.</p></div>
       <div class="group">
         <div class="row"><div class="row-copy"><b>Theme</b><small>Follow Windows or choose one.</small></div>
           <div class="seg" id="themeSeg" role="radiogroup" aria-label="Theme">

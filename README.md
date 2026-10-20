@@ -1,6 +1,6 @@
 # FlowDrop for Windows
 
-Local-first Windows image converter: an Electron app plus a native Win32/OLE radial wheel.
+Local-first Windows image converter: an Electron app plus a native Win32/OLE quick-convert surface.
 
 ## UI redesign (not built, run, or tested)
 - Frameless window with native Windows controls overlay and Mica backdrop (Windows 11; solid fallback elsewhere).
@@ -11,7 +11,7 @@ Local-first Windows image converter: an Electron app plus a native Win32/OLE rad
 
 ## Prerequisites
 - Windows 10/11, Node.js 20+
-- Native wheel only: Visual Studio Build Tools with the Desktop C++ workload (Developer PowerShell)
+- Native quick-convert surface only: Visual Studio Build Tools with the Desktop C++ workload (Developer PowerShell)
 
 ## Run
 ```cmd
@@ -25,16 +25,44 @@ npm run dev
 npm run dist
 ```
 
-## Build and launch the native wheel
+## Build and launch the native quick-convert surface
 ```powershell
 .\native\build.ps1
 .\native\FlowDropOlePoc.exe
 ```
 Press and hold the left mouse button on a file, then press Shift once to show
-the wheel. It remains visible until the file is released or Escape is pressed.
-Release over a supported output petal to convert. The source extension is
-detected from the real `IDataObject`, the same-format output is omitted, and
-the center identifies the source format (for example, `JPEG ->`).
+the quick-convert card. It remains visible until the file is released or
+Escape is pressed. Release over a highlighted output tile to convert. The
+source extension is detected from the real `IDataObject`, and the same-format
+output is omitted.
+
+## Context-menu Shift hover mode
+
+The native context-menu bridge provides the hover mode without adding a visible
+“Convert” command to Explorer. Build the native helper and shell extension into
+the same directory:
+
+```powershell
+.\native\build.ps1
+.\native\build-context-menu.ps1
+regsvr32 /s .\native\FlowDropContextMenu.dll
+```
+
+If Explorer has the previous DLL loaded and the build reports that the file is
+locked, build/register the alternate filename instead:
+
+```powershell
+.\native\build-context-menu.ps1 -OutputName FlowDropContextMenuFixed.dll
+regsvr32 /s .\native\FlowDropContextMenuFixed.dll
+```
+
+After registration, right-click a supported file in Explorer. The shell
+extension captures the selected path while Explorer is creating the context
+menu and starts a dormant FlowDrop helper. Press and hold Shift to reveal the
+format card, move over a format, and release the left mouse button to convert.
+Escape cancels the card. The helper is deliberately dormant until Shift so the
+normal Explorer menu remains usable. Releasing Shift while the pointer is over a format commits
+the conversion; clicking with the left mouse button also commits it.
 
 ## Build a Windows installer
 ```powershell
@@ -70,8 +98,8 @@ The repository also contains a standalone Win32 proof of concept in
 `OleInitialize`, `RegisterDragDrop`, and a real `IDropTarget` implementation.
 The target extracts Explorer files from `IDataObject` using `CF_HDROP` and
 `DragQueryFileW`, logs `DragEnter`, `DragOver`, `DragLeave`, and `Drop`, reads
-`MK_SHIFT`/`MK_ALT`/`MK_CONTROL`, and converts dropped images to JPEG, BMP, or
-TIFF with GDI+ encoders that are available on the machine.
+the Shift activation state, and converts dropped images to JPG, PNG, WEBP,
+AVIF, or TIFF with GDI+ encoders that are available on the machine.
 It returns `DROPEFFECT_COPY`, preserving the source file. Document conversion
 uses a bundled or configured LibreOffice headless runtime for PDF, DOCX, XLSX,
 PPTX, and TXT.
@@ -84,15 +112,12 @@ Build and test from a Visual Studio Developer PowerShell:
 ```
 
 Then open File Explorer, press and hold the left mouse button on an image, and
-press Shift once. The wheel remains available for the entire active drag;
-holding Shift continuously is not required. The console should log
-`Input left=1 shift=1` and `Wheel shown`. The compact wheel is initially
-positioned at the cursor and stays anchored after OLE `DragEnter` so a petal
-can be selected. It uses shared, rounded petal paths; only output formats supported by
-the native GDI+ conversion engine are shown for the dragged image, and the
-source format itself is not offered as a redundant conversion. Release over a
-highlighted petal to write a uniquely named converted copy beside the original.
-Release outside a petal to receive `DROPEFFECT_NONE`. The wheel is clamped to
+press Shift once. The card remains available for the entire active drag;
+holding Shift continuously is not required. The surface is positioned beside
+the cursor, shows the source name and format, and presents only output formats
+supported by the native GDI+ conversion engine. Release over a highlighted
+format tile to write a uniquely named converted copy beside the original.
+Release outside a tile to receive `DROPEFFECT_NONE`. The card is clamped to
 the current work area when the cursor is near a screen edge.
 
 Document conversion supports PDF, DOCX, XLSX, PPTX, and TXT as source and
@@ -101,7 +126,7 @@ at `native\libreoffice\program\soffice.exe` beside the native executable, or
 set `FLOWDROP_LIBREOFFICE` to an installed `soffice.exe` path. The target
 launches LibreOffice headlessly, writes a uniquely named `-converted` copy,
 and never overwrites the original or an existing output. If the runtime is not
-available, document petals remain unavailable and the drop returns
+available, document tiles remain unavailable and the drop returns
 `DROPEFFECT_NONE`.
 
 The implementation follows Microsoft's [RegisterDragDrop
@@ -110,12 +135,12 @@ documentation](https://learn.microsoft.com/en-us/windows/win32/api/ole2/nf-ole2-
 and [Shell clipboard format documentation](https://learn.microsoft.com/en-us/windows/win32/shell/clipboard).
 
 The POC now uses a hybrid arrangement: low-level input is used only to show and
-position the wheel after left mouse plus Shift activates the gesture. The actual
+position the card after left mouse plus Shift activates the gesture. The actual
 file list and conversion still come only from the registered OLE target's
 `IDataObject`; the input observer never fabricates paths or performs a drop.
-This makes the wheel follow the cursor without replacing the OLE data contract.
+This makes the card follow the cursor without replacing the OLE data contract.
 
-This POC intentionally keeps the wheel as a registered drop target only where
+This POC intentionally keeps the card as a registered drop target only where
 the HWND is visible. Windows calls `IDropTarget::DragEnter` only after the
 cursor enters that HWND; it does not notify the POC when a drag starts
 elsewhere during an Explorer drag. Consequently, this proves real OLE data

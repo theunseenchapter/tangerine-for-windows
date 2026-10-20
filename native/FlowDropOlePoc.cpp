@@ -1,22 +1,39 @@
+// FlowDrop Quick Convert  -  radial wheel edition
+//
+// Build (MSVC, Developer Command Prompt):
+//   cl /std:c++17 /EHsc /O2 /DUNICODE /D_UNICODE FlowDrop.cpp /link /SUBSYSTEM:WINDOWS
+//
+// Usage
+//   Drag mode   : start dragging a file, press Shift -> a wheel opens under the cursor.
+//                 Flick toward a format (or scroll the mouse wheel to rotate), release to convert.
+//   Context mode: FlowDrop.exe --context-file="C:\path\file.png"
+//                 Wheel opens at the cursor. Click / Enter to convert, arrows or scroll to rotate, Esc to cancel.
+
 #define UNICODE
 #define _UNICODE
+#define NOMINMAX
+
+#include <algorithm>
+using std::min;
+using std::max;
+
 #include <windows.h>
+#include <mmsystem.h>
 #include <ole2.h>
 #include <oleidl.h>
 #include <shellapi.h>
 #include <gdiplus.h>
 #include <shlwapi.h>
 #include <strsafe.h>
+#include <shellscalingapi.h>
 #include <vector>
 #include <string>
-#include <algorithm>
 #include <array>
+#include <thread>
 #include <cmath>
 #include <cstdio>
 #include <cstdarg>
-#include <memory>
 #include <climits>
-#include <shellscalingapi.h>
 
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "shell32.lib")
@@ -24,106 +41,136 @@
 #pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "shcore.lib")
 #pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "winmm.lib")
+#pragma comment(lib, "user32.lib")
+#pragma comment(lib, "gdi32.lib")
 
 using namespace Gdiplus;
 
-static constexpr UINT WM_APP_SHOW_WHEEL = WM_APP + 1;
-static constexpr UINT WM_APP_HIDE_WHEEL = WM_APP + 2;
-static constexpr UINT_PTR TIMER_INPUT = 1;
-static constexpr UINT_PTR TIMER_ANIM = 2;
+// ---------------------------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------------------------
+static constexpr UINT  WM_APP_SHOW_CARD = WM_APP + 1;
+static constexpr UINT  WM_APP_HIDE_CARD = WM_APP + 2;
+static constexpr UINT  WM_APP_DONE      = WM_APP + 3;
+static constexpr float PI               = 3.14159265359f;
 
-// ---------------------------------------------------------------------------
-// Design tokens.  All sizes are expressed at 96 DPI and scaled once.
-// The visible flower is 160 px across; the extra margin on every side belongs
-// to the per-pixel-alpha surface and holds the soft shadow.
-// ---------------------------------------------------------------------------
-static constexpr int WHEEL_SIZE_96 = 192;
-static constexpr float WHEEL_RADIUS_96 = 80.0f;
-static constexpr float HUB_RADIUS_96 = 21.0f;
-static constexpr float PETAL_INNER_RADIUS_96 = 27.0f;
-static constexpr float PETAL_GAP_DEGREES = 3.6f;
-static constexpr float PETAL_SWEEP_DEGREES = 45.0f - PETAL_GAP_DEGREES;
-static constexpr float PI_F = 3.14159265359f;
-static constexpr ULONGLONG OPEN_MS = 160;      // fade/scale-in duration
-static constexpr float HOVER_EASE = 0.34f;     // per 16 ms frame
-static constexpr float OPEN_START_SCALE = 0.90f;
+// Wheel geometry (logical pixels, scaled by DPI at runtime)
+static constexpr float WIN_SIZE  = 460.f;   // window edge
+static constexpr float R_DISC    = 190.f;   // glass disc
+static constexpr float R_TRACK   = 180.f;   // outer indicator track
+static constexpr float R_OUT     = 162.f;   // segment outer radius
+static constexpr float R_IN      = 84.f;    // segment inner radius
+static constexpr float R_HUB     = 66.f;    // centre hub
+static constexpr float SEG_GAP   = 3.f;
+static constexpr float SEG_INSET = 4.f;     // corner rounding
 
+// ---------------------------------------------------------------------------------------------
+// Theme
+// ---------------------------------------------------------------------------------------------
 struct Theme {
-    Color face, faceUnavailable, border, ink, accentTop, accentBottom, accentInk, shadow;
+    Color panelTop, panelBottom, rim, segA, segB, hub, hubEdge;
+    Color ink, muted, accentA, accentB, onAccent, shadow, good, bad;
 };
+
 static const Theme kDark = {
-    Color(214, 36, 37, 42), Color(70, 36, 37, 42), Color(70, 255, 255, 255),
-    Color(255, 236, 237, 241), Color(255, 255, 160, 82), Color(255, 245, 120, 40),
-    Color(255, 255, 255, 255), Color(255, 0, 0, 0)
+    Color(245, 36, 38, 48),  Color(245, 19, 20, 27),  Color(70, 255, 255, 255),
+    Color(255, 52, 55, 68),  Color(255, 40, 42, 53),  Color(255, 14, 15, 20),  Color(45, 255, 255, 255),
+    Color(255, 245, 246, 249), Color(255, 148, 154, 168),
+    Color(255, 255, 128, 64),  Color(255, 255, 66, 112), Color(255, 255, 255, 255),
+    Color(140, 0, 0, 0), Color(255, 66, 210, 130), Color(255, 242, 86, 86)
 };
 static const Theme kLight = {
-    Color(222, 252, 252, 254), Color(78, 252, 252, 254), Color(60, 20, 22, 30),
-    Color(255, 38, 40, 48), Color(255, 255, 160, 82), Color(255, 245, 120, 40),
-    Color(255, 255, 255, 255), Color(255, 30, 20, 10)
+    Color(248, 255, 255, 255), Color(248, 236, 239, 247), Color(60, 30, 36, 60),
+    Color(255, 236, 239, 247), Color(255, 225, 229, 240), Color(255, 250, 251, 254), Color(45, 30, 36, 60),
+    Color(255, 28, 32, 44), Color(255, 108, 115, 132),
+    Color(255, 255, 112, 48), Color(255, 244, 60, 110), Color(255, 255, 255, 255),
+    Color(90, 40, 48, 90), Color(255, 34, 170, 100), Color(255, 226, 64, 64)
 };
+static Theme g_theme = kDark;
 
-static HWND g_window;
-static bool g_dragging;
-static bool g_leftButtonDown;
-static bool g_shift;
-static bool g_shiftActivated;
-static bool g_cancelled;
-static bool g_oleInteractionObserved;
-static bool g_verbose;
-static int g_hover = -1;
-static bool g_supported[8] = {};
-static float g_mix[8] = {};
-static float g_scale = 1.0f;
-static int g_left = INT_MIN, g_top = INT_MIN;
-static ULONGLONG g_openStart;
-static ULONG_PTR g_gdiplusToken;
-static std::vector<std::wstring> g_files;
-static std::wstring g_dragLabel = L"CONVERT";
-static HHOOK g_mouseHook;
-static HHOOK g_keyboardHook;
-static bool g_previewMode;
-static std::wstring g_sourceFormatLabel = L"FILE";
-
+// ---------------------------------------------------------------------------------------------
+// Formats
+// ---------------------------------------------------------------------------------------------
 struct OutputFormat {
     const wchar_t* label;
     const wchar_t* extension;
-    const wchar_t* mime;
+    const wchar_t* mime;   // empty = document format handled by LibreOffice
+    const wchar_t* hint;   // short caption shown under the label
 };
 
-// Document sources use the first five slots; image sources use the final
-// three slots. Unsupported slots remain visible as structure but cannot be
-// selected.
-static constexpr std::array<OutputFormat, 8> kFormats = {{
-    { L"PDF",  L".pdf",  L"" },
-    { L"DOCX", L".docx", L"" },
-    { L"XLSX", L".xlsx", L"" },
-    { L"PPTX", L".pptx", L"" },
-    { L"TXT",  L".txt",  L"" },
-    { L"JPEG", L".jpg",  L"image/jpeg" },
-    { L"BMP",  L".bmp",  L"image/bmp" },
-    { L"TIFF", L".tiff", L"image/tiff" }
+static constexpr std::array<OutputFormat, 10> kFormats = {{
+    { L"JPG",  L".jpg",  L"image/jpeg", L"Photo"      },
+    { L"PNG",  L".png",  L"image/png",  L"Lossless"   },
+    { L"WEBP", L".webp", L"image/webp", L"Web"        },
+    { L"AVIF", L".avif", L"image/avif", L"Next-gen"   },
+    { L"BMP",  L".bmp",  L"image/bmp",  L"Bitmap"     },
+    { L"GIF",  L".gif",  L"image/gif",  L"256 colors" },
+    { L"TIFF", L".tiff", L"image/tiff", L"Archive"    },
+    { L"PDF",  L".pdf",  L"",           L"Document"   },
+    { L"DOCX", L".docx", L"",           L"Word"       },
+    { L"TXT",  L".txt",  L"",           L"Plain text" }
 }};
 
-static void RenderLayeredWheel();
+enum class Phase { Idle, Busy, Success, Failed };
 
-static const Theme& CurrentTheme()
-{
-    DWORD light = 0, size = sizeof(light);
-    if (RegGetValueW(HKEY_CURRENT_USER,
-            L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
-            L"AppsUseLightTheme", RRF_RT_REG_DWORD, nullptr, &light, &size) != ERROR_SUCCESS) {
-        light = 0;
-    }
-    return light ? kLight : kDark;
-}
+// ---------------------------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------------------------
+static HWND      g_window = nullptr;
+static HHOOK     g_mouseHook = nullptr;
+static HHOOK     g_keyboardHook = nullptr;
+static ULONG_PTR g_gdiplusToken = 0;
+static FontFamily* g_fontFamily = nullptr;
 
-static float WheelScale() { return g_scale; }
+static std::vector<std::wstring> g_files;       // context mode files
+static std::vector<int>          g_items;       // format indices shown on the wheel
+static int   g_selected = -1;                   // index into g_items
+static bool  g_wheelOverride = false;           // selection came from scroll / keys
+static POINT g_lastPt = { INT_MIN, INT_MIN };
+static int   g_wheelAccum = 0;
 
-static int WheelSize()
-{
-    return static_cast<int>(std::lround(WHEEL_SIZE_96 * g_scale));
-}
+static bool  g_leftDown = false;
+static bool  g_dragging = false;
+static bool  g_shift = false;
+static bool  g_shiftConfirmed = false;
+static bool  g_cancelled = false;
+static bool  g_verbose = false;
+static bool  g_contextMode = false;
+static bool  g_quitPending = false;
+static POINT g_downPt = {};
 
+static Phase  g_phase = Phase::Idle;
+static double g_phaseTime = 0.0;
+static double g_startTime = 0.0;
+
+static std::wstring g_source = L"FILE";
+static std::wstring g_filename;
+
+// window / animation
+static bool  g_visible = false;     // logically open
+static bool  g_shown = false;       // window actually on screen (includes fade-out)
+static int   g_winX = 0, g_winY = 0, g_winSize = 0;
+static float g_scale = 1.0f;
+static float g_alpha = 0.f;
+static float g_pop = 0.8f, g_popVel = 0.f;
+static float g_pulse = 0.f;
+static float g_knob = -90.f, g_knobAlpha = 0.f;
+static float g_spin = 0.f;
+static std::array<float, 16> g_hoverAnim = {};
+static double g_itemsStart = 0.0;
+static double g_lastFrame = 0.0;
+
+// back buffer
+static HDC     g_memDC = nullptr;
+static HBITMAP g_dib = nullptr;
+static HGDIOBJ g_oldBmp = nullptr;
+static void*   g_pixels = nullptr;
+static int     g_surfaceSize = 0;
+
+// ---------------------------------------------------------------------------------------------
+// Small helpers
+// ---------------------------------------------------------------------------------------------
 static void Log(const wchar_t* format, ...)
 {
     wchar_t buffer[1024];
@@ -136,85 +183,116 @@ static void Log(const wchar_t* format, ...)
     OutputDebugStringW(L"\n");
 }
 
-static void ResetAnimationState()
+static double Now()
 {
-    for (float& m : g_mix) m = 0.0f;
-    g_hover = -1;
+    static LARGE_INTEGER freq = [] { LARGE_INTEGER f; QueryPerformanceFrequency(&f); return f; }();
+    LARGE_INTEGER t; QueryPerformanceCounter(&t);
+    return static_cast<double>(t.QuadPart) / static_cast<double>(freq.QuadPart);
 }
 
-static void HideWheel(const wchar_t* reason)
+static float Clamp(float v, float lo, float hi) { return std::max(lo, std::min(hi, v)); }
+static float Lerp(float a, float b, float t) { return a + (b - a) * t; }
+static float EaseOutCubic(float t) { const float u = 1.0f - t; return 1.0f - u * u * u; }
+static float Smooth(float cur, float target, float rate, float dt)
 {
-    if (g_window && IsWindowVisible(g_window)) {
-        Log(L"Wheel hidden: %s", reason);
-        KillTimer(g_window, TIMER_ANIM);
-        ShowWindow(g_window, SW_HIDE);
-    }
-    g_left = g_top = INT_MIN;
-    ResetAnimationState();
+    return cur + (target - cur) * (1.0f - std::exp(-rate * dt));
 }
 
-static void StartAnimation()
+static Color Mix(const Color& a, const Color& b, float t)
 {
-    if (g_window) SetTimer(g_window, TIMER_ANIM, 16, nullptr);
+    auto m = [&](int x, int y) { return static_cast<BYTE>(x + (y - x) * t + 0.5f); };
+    return Color(m(a.GetA(), b.GetA()), m(a.GetR(), b.GetR()), m(a.GetG(), b.GetG()), m(a.GetB(), b.GetB()));
+}
+static Color Fade(const Color& c, float k)
+{
+    return Color(static_cast<BYTE>(c.GetA() * Clamp(k, 0.f, 1.f) + 0.5f), c.GetR(), c.GetG(), c.GetB());
+}
+static PointF Polar(float r, float deg)
+{
+    const float a = deg * PI / 180.0f;
+    return PointF(r * std::cos(a), r * std::sin(a));
 }
 
-static float OpenProgress()
+static Theme CurrentTheme()
 {
-    const ULONGLONG elapsed = GetTickCount64() - g_openStart;
-    if (elapsed >= OPEN_MS) return 1.0f;
-    const float t = static_cast<float>(elapsed) / static_cast<float>(OPEN_MS);
-    const float inv = 1.0f - t;
-    return 1.0f - inv * inv * inv;
+    DWORD light = 0, size = sizeof(light);
+    RegGetValueW(HKEY_CURRENT_USER,
+        L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+        L"AppsUseLightTheme", RRF_RT_REG_DWORD, nullptr, &light, &size);
+    return light ? kLight : kDark;
 }
 
-static void SetHover(int hover)
+// ---------------------------------------------------------------------------------------------
+// File type helpers
+// ---------------------------------------------------------------------------------------------
+static bool IsImage(const std::wstring& file)
 {
-    if (hover == g_hover) return;
-    g_hover = hover;
-    StartAnimation();
+    const wchar_t* ext = PathFindExtensionW(file.c_str());
+    if (!ext) return false;
+    static const wchar_t* extensions[] = {
+        L".jpg", L".jpeg", L".png", L".webp", L".avif", L".bmp", L".gif", L".tif", L".tiff", L".heic"
+    };
+    for (const auto* e : extensions) if (_wcsicmp(ext, e) == 0) return true;
+    return false;
+}
+
+static bool IsDocument(const std::wstring& file)
+{
+    const wchar_t* ext = PathFindExtensionW(file.c_str());
+    if (!ext) return false;
+    static const wchar_t* extensions[] = { L".pdf", L".docx", L".xlsx", L".pptx", L".txt" };
+    for (const auto* e : extensions) if (_wcsicmp(ext, e) == 0) return true;
+    return false;
+}
+
+static std::wstring SourceFormat(const std::wstring& file)
+{
+    const wchar_t* ext = PathFindExtensionW(file.c_str());
+    if (!ext || !*ext) return L"FILE";
+    std::wstring s = ext + 1;
+    std::transform(s.begin(), s.end(), s.begin(), [](wchar_t c) { return static_cast<wchar_t>(towupper(c)); });
+    if (s == L"JPEG") s = L"JPG";
+    if (s == L"TIF") s = L"TIFF";
+    if (s.size() > 5) s = L"FILE";
+    return s;
+}
+
+static std::wstring ShortName(const std::wstring& file)
+{
+    std::wstring name = PathFindFileNameW(file.c_str());
+    if (name.size() > 35) name = name.substr(0, 31) + L"...";
+    return name;
+}
+
+static bool SameFormat(const std::wstring& file, int format)
+{
+    const wchar_t* ext = PathFindExtensionW(file.c_str());
+    if (!ext || format < 0 || format >= static_cast<int>(kFormats.size())) return false;
+    if (_wcsicmp(ext, kFormats[format].extension) == 0) return true;
+    if (_wcsicmp(ext, L".jpeg") == 0 && wcscmp(kFormats[format].label, L"JPG") == 0) return true;
+    if (_wcsicmp(ext, L".tif") == 0 && wcscmp(kFormats[format].label, L"TIFF") == 0) return true;
+    return false;
 }
 
 static int EncoderClsid(const wchar_t* mime, CLSID* clsid)
 {
-    UINT count = 0;
-    UINT bytes = 0;
+    UINT count = 0, bytes = 0;
     GetImageEncodersSize(&count, &bytes);
     if (!bytes) return 0;
     std::vector<BYTE> buffer(bytes);
     auto* encoders = reinterpret_cast<ImageCodecInfo*>(buffer.data());
     GetImageEncoders(count, bytes, encoders);
     for (UINT i = 0; i < count; ++i) {
-        if (wcscmp(encoders[i].MimeType, mime) == 0) {
-            *clsid = encoders[i].Clsid;
-            return 1;
-        }
+        if (wcscmp(encoders[i].MimeType, mime) == 0) { *clsid = encoders[i].Clsid; return 1; }
     }
     return 0;
 }
 
-static const wchar_t* FormatName(int index)
-{
-    return index >= 0 && index < static_cast<int>(kFormats.size())
-        ? kFormats[index].label : L"FILE";
-}
-
-static bool IsDocumentFile(const std::wstring& file)
-{
-    const wchar_t* extension = PathFindExtensionW(file.c_str());
-    if (!extension) return false;
-    return _wcsicmp(extension, L".pdf") == 0 ||
-        _wcsicmp(extension, L".docx") == 0 ||
-        _wcsicmp(extension, L".xlsx") == 0 ||
-        _wcsicmp(extension, L".pptx") == 0 ||
-        _wcsicmp(extension, L".txt") == 0;
-}
-
-static std::wstring FindLibreOffice()
+static std::wstring LibreOfficePath()
 {
     wchar_t value[MAX_PATH] = {};
     DWORD length = GetEnvironmentVariableW(L"FLOWDROP_LIBREOFFICE", value, ARRAYSIZE(value));
     if (length && length < ARRAYSIZE(value) && PathFileExistsW(value)) return value;
-
     wchar_t executable[MAX_PATH] = {};
     GetModuleFileNameW(nullptr, executable, ARRAYSIZE(executable));
     PathRemoveFileSpecW(executable);
@@ -225,99 +303,505 @@ static std::wstring FindLibreOffice()
         L"C:\\Program Files\\LibreOffice\\program\\soffice.exe",
         L"C:\\Program Files (x86)\\LibreOffice\\program\\soffice.exe"
     };
-    for (const auto& candidate : candidates) {
-        if (PathFileExistsW(candidate.c_str())) return candidate;
-    }
+    for (const auto& c : candidates) if (PathFileExistsW(c.c_str())) return c;
     return L"";
 }
 
-static bool IsSameFormat(const std::wstring& file, int format)
+// ---------------------------------------------------------------------------------------------
+// Conversion (runs on a worker thread so the drag source never freezes)
+// ---------------------------------------------------------------------------------------------
+static std::wstring OutputPath(const std::wstring& input, const wchar_t* extension)
 {
-    const wchar_t* extension = PathFindExtensionW(file.c_str());
-    if (!extension || format < 0 || format >= static_cast<int>(kFormats.size())) return false;
-    return _wcsicmp(extension, kFormats[format].extension) == 0 ||
-        (format == 5 && _wcsicmp(extension, L".jpeg") == 0);
+    wchar_t stem[MAX_PATH] = {};
+    StringCchCopyW(stem, ARRAYSIZE(stem), input.c_str());
+    PathRemoveExtensionW(stem);
+    wchar_t output[MAX_PATH] = {};
+    StringCchPrintfW(output, ARRAYSIZE(output), L"%s-converted%s", stem, extension);
+    for (int n = 2; PathFileExistsW(output) && n < 1000; ++n)
+        StringCchPrintfW(output, ARRAYSIZE(output), L"%s-converted-%d%s", stem, n, extension);
+    return output;
 }
 
-static bool RunLibreOffice(const std::wstring& input, int format, const std::wstring& output)
+static bool ConvertDocument(const std::wstring& input, int format, const std::wstring& output)
 {
-    const std::wstring soffice = FindLibreOffice();
-    if (soffice.empty()) {
-        Log(L"LibreOffice was not found; set FLOWDROP_LIBREOFFICE or bundle libreoffice\\program\\soffice.exe");
-        return false;
-    }
-    const wchar_t* filter = kFormats[format].label;
-    wchar_t outputDirectory[MAX_PATH] = {};
-    StringCchCopyW(outputDirectory, ARRAYSIZE(outputDirectory), output.c_str());
-    PathRemoveFileSpecW(outputDirectory);
-    wchar_t generated[MAX_PATH] = {};
-    StringCchCopyW(generated, ARRAYSIZE(generated), input.c_str());
-    PathRemoveExtensionW(generated);
-    StringCchCatW(generated, ARRAYSIZE(generated), kFormats[format].extension);
-    std::wstring command = L"\"" + soffice + L"\" --headless --convert-to ";
-    command += filter;
-    command += L" --outdir \"" + std::wstring(outputDirectory) + L"\"";
-    command += L" \"" + input + L"\"";
+    const std::wstring office = LibreOfficePath();
+    if (office.empty()) return false;
 
+    // Convert inside a private temp folder so we can never overwrite an existing sibling file.
+    wchar_t temp[MAX_PATH] = {};
+    if (!GetTempPathW(ARRAYSIZE(temp), temp)) return false;
+    wchar_t dir[MAX_PATH] = {};
+    StringCchPrintfW(dir, ARRAYSIZE(dir), L"%sflowdrop-%lu-%llu", temp,
+        GetCurrentProcessId(), static_cast<unsigned long long>(GetTickCount64()));
+    if (!CreateDirectoryW(dir, nullptr)) return false;
+
+    std::wstring filter = kFormats[format].extension + 1;
+    if (wcscmp(kFormats[format].label, L"TXT") == 0) filter = L"txt:Text";
+
+    std::wstring command = L"\"" + office + L"\" --headless --norestore --convert-to " + filter;
+    command += L" --outdir \"" + std::wstring(dir) + L"\" \"" + input + L"\"";
     std::vector<wchar_t> mutableCommand(command.begin(), command.end());
     mutableCommand.push_back(L'\0');
+
     STARTUPINFOW startup = { sizeof(startup) };
     PROCESS_INFORMATION process = {};
-    if (!CreateProcessW(nullptr, mutableCommand.data(), nullptr, nullptr, FALSE,
+    bool ok = false;
+    if (CreateProcessW(nullptr, mutableCommand.data(), nullptr, nullptr, FALSE,
         CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process)) {
-        Log(L"Could not start LibreOffice (error=%lu)", GetLastError());
-        return false;
+        if (WaitForSingleObject(process.hProcess, 180000) == WAIT_TIMEOUT)
+            TerminateProcess(process.hProcess, 1);
+        DWORD exitCode = 1;
+        GetExitCodeProcess(process.hProcess, &exitCode);
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+
+        wchar_t stem[MAX_PATH] = {};
+        StringCchCopyW(stem, ARRAYSIZE(stem), PathFindFileNameW(input.c_str()));
+        PathRemoveExtensionW(stem);
+        const std::wstring generated = std::wstring(dir) + L"\\" + stem + kFormats[format].extension;
+        ok = exitCode == 0 && PathFileExistsW(generated.c_str()) &&
+            MoveFileExW(generated.c_str(), output.c_str(), MOVEFILE_COPY_ALLOWED) != FALSE;
+        DeleteFileW(generated.c_str());
     }
-    WaitForSingleObject(process.hProcess, INFINITE);
-    DWORD exitCode = 1;
-    GetExitCodeProcess(process.hProcess, &exitCode);
-    CloseHandle(process.hThread);
-    CloseHandle(process.hProcess);
-    if (exitCode != 0 || !PathFileExistsW(generated)) return false;
-    if (!MoveFileExW(generated, output.c_str(), 0)) {
-        Log(L"Could not move LibreOffice output to %s (error=%lu)",
-            output.c_str(), GetLastError());
-        return false;
-    }
-    return true;
+    RemoveDirectoryW(dir);
+    return ok;
 }
 
 static bool ConvertFile(const std::wstring& input, int format)
 {
-    if (format < 0 || format >= static_cast<int>(kFormats.size()) ||
-        !kFormats[format].extension[0] || IsSameFormat(input, format)) return false;
-    const auto& outputFormat = kFormats[format];
-    wchar_t stem[MAX_PATH];
-    StringCchCopyW(stem, ARRAYSIZE(stem), input.c_str());
-    PathRemoveExtensionW(stem);
-    // Originals and earlier conversions are never overwritten.
-    wchar_t output[MAX_PATH];
-    StringCchPrintfW(output, ARRAYSIZE(output), L"%s-converted%s", stem, outputFormat.extension);
-    for (int n = 2; PathFileExistsW(output) && n < 1000; ++n) {
-        StringCchPrintfW(output, ARRAYSIZE(output), L"%s-converted-%d%s", stem, n, outputFormat.extension);
-    }
-    if (PathFileExistsW(output)) return false;
+    if (format < 0 || format >= static_cast<int>(kFormats.size()) || SameFormat(input, format)) return false;
+    const std::wstring output = OutputPath(input, kFormats[format].extension);
+    if (PathFileExistsW(output.c_str())) return false;
+    if (!kFormats[format].mime[0]) return ConvertDocument(input, format, output);
 
-    if (!outputFormat.mime[0]) return RunLibreOffice(input, format, output);
     CLSID encoder;
-    if (!EncoderClsid(outputFormat.mime, &encoder)) return false;
+    if (!EncoderClsid(kFormats[format].mime, &encoder)) return false;
     Bitmap bitmap(input.c_str(), FALSE);
     if (bitmap.GetLastStatus() != Ok) return false;
-    return bitmap.Save(output, &encoder, nullptr) == Ok;
+
+    if (wcscmp(kFormats[format].mime, L"image/jpeg") == 0) {
+        // JPEG has no alpha: flatten onto white instead of getting black backgrounds.
+        const int w = static_cast<int>(bitmap.GetWidth());
+        const int h = static_cast<int>(bitmap.GetHeight());
+        Bitmap flat(w, h, PixelFormat32bppRGB);
+        {
+            Graphics g(&flat);
+            g.Clear(Color(255, 255, 255, 255));
+            g.DrawImage(&bitmap, 0, 0, w, h);
+        }
+        ULONG quality = 92;
+        EncoderParameters params = {};
+        params.Count = 1;
+        params.Parameter[0].Guid = EncoderQuality;
+        params.Parameter[0].Type = EncoderParameterValueTypeLong;
+        params.Parameter[0].NumberOfValues = 1;
+        params.Parameter[0].Value = &quality;
+        return flat.Save(output.c_str(), &encoder, &params) == Ok;
+    }
+    return bitmap.Save(output.c_str(), &encoder, nullptr) == Ok;
 }
 
+static void StartConversion(std::vector<std::wstring> files, int format)
+{
+    g_phase = Phase::Busy;
+    g_phaseTime = Now();
+    std::thread([files = std::move(files), format]() {
+        CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        bool ok = !files.empty();
+        for (const auto& f : files) {
+            if (!(IsImage(f) || IsDocument(f)) || !ConvertFile(f, format)) ok = false;
+        }
+        CoUninitialize();
+        PostMessageW(g_window, WM_APP_DONE, ok ? 1 : 0, 0);
+    }).detach();
+}
+
+// ---------------------------------------------------------------------------------------------
+// Wheel items + selection
+// ---------------------------------------------------------------------------------------------
+static void SetFile(const std::wstring& file)
+{
+    g_items.clear();
+    g_source = SourceFormat(file);
+    g_filename = ShortName(file);
+    const bool image = IsImage(file);
+    const bool document = IsDocument(file);
+    const bool office = document && !LibreOfficePath().empty();
+    for (int i = 0; i < static_cast<int>(kFormats.size()); ++i) {
+        if (SameFormat(file, i)) continue;
+        CLSID encoder;
+        const bool imageOutput = kFormats[i].mime[0] != L'\0';
+        bool ok = false;
+        if (image) ok = imageOutput && EncoderClsid(kFormats[i].mime, &encoder);
+        else if (document) ok = !imageOutput && office;
+        if (ok) g_items.push_back(i);
+    }
+    g_selected = -1;
+    g_wheelOverride = false;
+    g_lastPt = { INT_MIN, INT_MIN };
+    g_hoverAnim.fill(0.f);
+    g_itemsStart = Now();
+}
+
+static void SetSelected(int s)
+{
+    if (s != g_selected) { g_selected = s; g_pulse = 1.0f; }
+}
+
+// -1 = hub (dead zone), -2 = outside the disc, otherwise the segment index
+static int IndexAt(POINT p)
+{
+    const int n = static_cast<int>(g_items.size());
+    if (!n || !g_winSize) return -2;
+    const float half = g_winSize * 0.5f;
+    const float dx = (p.x - (g_winX + half)) / g_scale;
+    const float dy = (p.y - (g_winY + half)) / g_scale;
+    const float d = std::sqrt(dx * dx + dy * dy);
+    if (d > R_DISC) return -2;
+    if (d < R_HUB) return -1;
+    float a = std::atan2(dy, dx) + PI * 0.5f;          // 0 = top, clockwise
+    a = std::fmod(a, 2.0f * PI);
+    if (a < 0) a += 2.0f * PI;
+    const float step = 2.0f * PI / n;
+    return static_cast<int>(std::floor((a + step * 0.5f) / step)) % n;
+}
+
+static void SelectFromPoint(POINT p)
+{
+    if (p.x == g_lastPt.x && p.y == g_lastPt.y) return;   // only react to real movement
+    g_lastPt = p;
+    const int idx = IndexAt(p);
+    if (idx >= 0) { SetSelected(idx); g_wheelOverride = false; }
+    else if (idx == -2) { SetSelected(-1); g_wheelOverride = false; }
+    else if (!g_wheelOverride) SetSelected(-1);
+}
+
+static void StepSelection(int delta)
+{
+    const int n = static_cast<int>(g_items.size());
+    if (!n) return;
+    const int next = g_selected < 0 ? (delta > 0 ? 0 : n - 1) : (((g_selected + delta) % n) + n) % n;
+    g_wheelOverride = true;
+    SetSelected(next);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Window placement / lifetime
+// ---------------------------------------------------------------------------------------------
+static void EnsureSurface(int size)
+{
+    if (g_dib && g_surfaceSize == size) return;
+    if (g_dib) { SelectObject(g_memDC, g_oldBmp); DeleteObject(g_dib); g_dib = nullptr; }
+    if (!g_memDC) {
+        HDC screen = GetDC(nullptr);
+        g_memDC = CreateCompatibleDC(screen);
+        ReleaseDC(nullptr, screen);
+    }
+    BITMAPINFO bi = {};
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = size;
+    bi.bmiHeader.biHeight = -size;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    g_dib = CreateDIBSection(g_memDC, &bi, DIB_RGB_COLORS, &g_pixels, nullptr, 0);
+    g_oldBmp = SelectObject(g_memDC, g_dib);
+    g_surfaceSize = size;
+}
+
+static void PlaceCard(POINT point)
+{
+    HMONITOR monitor = MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO info = { sizeof(info) };
+    GetMonitorInfoW(monitor, &info);
+    UINT dpiX = 96, dpiY = 96;
+    if (SUCCEEDED(GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &dpiX, &dpiY)))
+        g_scale = static_cast<float>(dpiX) / 96.0f;
+
+    const int size = static_cast<int>(WIN_SIZE * g_scale + 0.5f);
+    int left = point.x - size / 2;
+    int top = point.y - size / 2;
+    left = std::max(static_cast<int>(info.rcWork.left), std::min(left, static_cast<int>(info.rcWork.right) - size));
+    top = std::max(static_cast<int>(info.rcWork.top), std::min(top, static_cast<int>(info.rcWork.bottom) - size));
+    g_winX = left; g_winY = top; g_winSize = size;
+    EnsureSurface(size);
+
+    g_visible = true;
+    if (!g_shown) {
+        g_theme = CurrentTheme();
+        g_alpha = 0.f; g_pop = 0.8f; g_popVel = 0.f;
+        g_pulse = 0.f; g_knobAlpha = 0.f;
+        g_hoverAnim.fill(0.f);
+        g_selected = -1; g_wheelOverride = false;
+        g_lastPt = { INT_MIN, INT_MIN };
+        g_wheelAccum = 0;
+        g_itemsStart = Now();
+        g_lastFrame = Now();
+        g_shown = true;
+    }
+    SetWindowPos(g_window, HWND_TOPMOST, left, top, size, size, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+}
+
+static void HideCard(const wchar_t* reason)
+{
+    if (!g_visible) return;
+    Log(L"Card hidden: %s", reason);
+    g_visible = false;     // fade-out is finished in FrameTick
+}
+
+static void FinishHide()
+{
+    ShowWindow(g_window, SW_HIDE);
+    g_shown = false;
+    g_items.clear();
+    g_selected = -1;
+    g_hoverAnim.fill(0.f);
+    if (g_quitPending) PostQuitMessage(0);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Rendering
+// ---------------------------------------------------------------------------------------------
+static void TextC(Graphics& g, const wchar_t* s, float cx, float cy, float w, float size,
+    const Color& color, FontStyle style = FontStyleRegular)
+{
+    if (!g_fontFamily) return;
+    Font font(g_fontFamily, size, style, UnitPixel);
+    SolidBrush brush(color);
+    StringFormat fmt(StringFormatFlagsNoWrap);
+    fmt.SetAlignment(StringAlignmentCenter);
+    fmt.SetLineAlignment(StringAlignmentCenter);
+    fmt.SetTrimming(StringTrimmingEllipsisCharacter);
+    g.DrawString(s, -1, &font, RectF(cx - w * 0.5f, cy - size, w, size * 2.0f), &fmt, &brush);
+}
+
+static void RenderCard()
+{
+    if (!g_window || !g_shown || !g_winSize) return;
+    const int W = g_winSize;
+    const Theme& T = g_theme;
+    const int n = static_cast<int>(g_items.size());
+
+    Bitmap surface(W, W, W * 4, PixelFormat32bppPARGB, static_cast<BYTE*>(g_pixels));
+    Graphics g(&surface);
+    g.SetSmoothingMode(SmoothingModeAntiAlias);
+    g.SetPixelOffsetMode(PixelOffsetModeHighQuality);
+    g.SetTextRenderingHint(TextRenderingHintAntiAlias);
+    g.Clear(Color(0, 0, 0, 0));
+
+    const float s = g_scale * Clamp(g_pop, 0.5f, 1.2f);
+    g.TranslateTransform(W * 0.5f, W * 0.5f);
+    g.ScaleTransform(s, s);
+
+    // --- soft shadow --------------------------------------------------------------------------
+    for (int k = 15; k >= 1; --k) {
+        const float a = T.shadow.GetA() * std::pow(1.0f - k / 16.0f, 2.0f) * 0.22f;
+        SolidBrush b(Color(static_cast<BYTE>(a), T.shadow.GetR(), T.shadow.GetG(), T.shadow.GetB()));
+        const float r = R_DISC + k;
+        g.FillEllipse(&b, -r, -r + 7.0f, r * 2.0f, r * 2.0f);
+    }
+
+    // --- glass disc -----------------------------------------------------------------------------
+    {
+        LinearGradientBrush bg(PointF(0, -R_DISC), PointF(0, R_DISC), T.panelTop, T.panelBottom);
+        g.FillEllipse(&bg, -R_DISC, -R_DISC, R_DISC * 2.0f, R_DISC * 2.0f);
+        Pen rim(T.rim, 1.0f);
+        g.DrawEllipse(&rim, -R_DISC, -R_DISC, R_DISC * 2.0f, R_DISC * 2.0f);
+        Pen track(Fade(T.rim, 0.55f), 2.0f);
+        g.DrawEllipse(&track, -R_TRACK, -R_TRACK, R_TRACK * 2.0f, R_TRACK * 2.0f);
+    }
+
+    // --- scroll indicator (smooth orbiting knob + arc) -------------------------------------------
+    const float step = n > 0 ? 360.0f / n : 360.0f;
+    if (g_knobAlpha > 0.01f && n > 0) {
+        const float sweep = std::min(step * 0.7f, 56.0f);
+        Pen arc(Fade(T.accentA, g_knobAlpha), 3.5f);
+        arc.SetLineCap(LineCapRound, LineCapRound, DashCapRound);
+        g.DrawArc(&arc, -R_TRACK, -R_TRACK, R_TRACK * 2.0f, R_TRACK * 2.0f, g_knob - sweep * 0.5f, sweep);
+        const PointF kp = Polar(R_TRACK, g_knob);
+        const Color kc = Mix(T.accentA, T.accentB, 0.5f);
+        for (int k = 3; k >= 1; --k) {
+            SolidBrush glow(Fade(kc, 0.10f * g_knobAlpha * (4 - k)));
+            const float r = 4.5f + 3.0f * k;
+            g.FillEllipse(&glow, kp.X - r, kp.Y - r, r * 2.0f, r * 2.0f);
+        }
+        SolidBrush dot(Fade(kc, g_knobAlpha));
+        g.FillEllipse(&dot, kp.X - 4.5f, kp.Y - 4.5f, 9.0f, 9.0f);
+    }
+
+    // --- segments -------------------------------------------------------------------------------
+    const double since = Now() - g_itemsStart;
+    for (int i = 0; i < n; ++i) {
+        const OutputFormat& f = kFormats[g_items[i]];
+        const float h = Clamp(g_hoverAnim[i], 0.f, 1.f);
+        const float e = EaseOutCubic(Clamp(static_cast<float>(since * 1000.0 - i * 35.0) / 280.0f, 0.f, 1.f));
+        if (e <= 0.f) continue;
+
+        const float centerDeg = -90.0f + i * step;
+        const float ri = R_IN;
+        const float roFull = R_OUT + 10.0f * h;
+        const float ro = ri + 8.0f + (roFull - ri - 8.0f) * e;
+        const float rm = (ri + ro) * 0.5f;
+        const float angInset = (SEG_GAP * 0.5f + SEG_INSET) / rm * 180.0f / PI;
+        const float start = centerDeg - step * 0.5f + angInset;
+        const float sweep = std::max(step - 2.0f * angInset, 6.0f);
+        const float rO = ro - SEG_INSET, rI = ri + SEG_INSET;
+
+        GraphicsPath path;
+        path.AddArc(RectF(-rO, -rO, rO * 2.0f, rO * 2.0f), start, sweep);
+        path.AddArc(RectF(-rI, -rI, rI * 2.0f, rI * 2.0f), start + sweep, -sweep);
+        path.CloseFigure();
+
+        if (h > 0.02f) {
+            for (int k = 1; k <= 3; ++k) {
+                Pen glow(Fade(T.accentA, 0.15f * h / k), SEG_INSET * 2.0f + 7.0f * k);
+                glow.SetLineJoin(LineJoinRound);
+                g.DrawPath(&glow, &path);
+            }
+        }
+
+        const PointF p1 = Polar(rI, centerDeg), p2 = Polar(rO, centerDeg);
+        LinearGradientBrush br(p1, p2, Mix(T.segA, T.accentA, h), Mix(T.segB, T.accentB, h));
+        Pen edge(&br, SEG_INSET * 2.0f);
+        edge.SetLineJoin(LineJoinRound);
+        g.FillPath(&br, &path);
+        g.DrawPath(&edge, &path);
+
+        const PointF lp = Polar(rm, centerDeg);
+        TextC(g, f.label, lp.X, lp.Y - 6.0f - 1.5f * h, 96.0f, 15.0f + 2.0f * h,
+            Fade(Mix(T.ink, T.onAccent, h), e), FontStyleBold);
+        TextC(g, f.hint, lp.X, lp.Y + 12.0f, 96.0f, 9.5f,
+            Fade(Mix(T.muted, Color(210, 255, 255, 255), h), e));
+    }
+
+    // --- hub -------------------------------------------------------------------------------------
+    {
+        const float hr = R_HUB * (1.0f + 0.05f * g_pulse);
+        SolidBrush hubBrush(T.hub);
+        g.FillEllipse(&hubBrush, -hr, -hr, hr * 2.0f, hr * 2.0f);
+        Pen hubEdge(T.hubEdge, 1.0f);
+        g.DrawEllipse(&hubEdge, -hr, -hr, hr * 2.0f, hr * 2.0f);
+
+        const float rr = hr + 6.0f;
+        if (g_phase == Phase::Busy) {
+            Pen track(Fade(T.rim, 0.8f), 2.5f);
+            g.DrawEllipse(&track, -rr, -rr, rr * 2.0f, rr * 2.0f);
+            Pen spin(T.accentA, 3.0f);
+            spin.SetLineCap(LineCapRound, LineCapRound, DashCapRound);
+            g.DrawArc(&spin, -rr, -rr, rr * 2.0f, rr * 2.0f, g_spin, 110.0f);
+        } else if (g_phase == Phase::Success || g_phase == Phase::Failed) {
+            Pen ring(g_phase == Phase::Success ? T.good : T.bad, 2.5f);
+            g.DrawEllipse(&ring, -rr, -rr, rr * 2.0f, rr * 2.0f);
+        } else if (g_knobAlpha > 0.01f) {
+            Pen ring(Fade(Mix(T.accentA, T.accentB, 0.5f), 0.9f * g_knobAlpha), 2.0f);
+            g.DrawEllipse(&ring, -rr, -rr, rr * 2.0f, rr * 2.0f);
+        }
+
+        const wchar_t* target = g_selected >= 0 && g_selected < n ? kFormats[g_items[g_selected]].label : L"";
+        if (g_phase == Phase::Success || g_phase == Phase::Failed) {
+            const bool ok = g_phase == Phase::Success;
+            Pen mark(ok ? T.good : T.bad, 4.5f);
+            mark.SetLineCap(LineCapRound, LineCapRound, DashCapRound);
+            mark.SetLineJoin(LineJoinRound);
+            if (ok) {
+                const PointF pts[3] = { PointF(-12, -9), PointF(-4, -1), PointF(12, -17) };
+                g.DrawLines(&mark, pts, 3);
+            } else {
+                g.DrawLine(&mark, PointF(-8, -17), PointF(8, -1));
+                g.DrawLine(&mark, PointF(8, -17), PointF(-8, -1));
+            }
+            TextC(g, ok ? L"Done" : L"Failed", 0, 15, 100, 17, ok ? T.good : T.bad, FontStyleBold);
+            TextC(g, ok ? L"Saved next to original" : L"Couldn't convert", 0, 37, 108, 9, T.muted);
+        } else if (g_phase == Phase::Busy) {
+            TextC(g, L"CONVERTING", 0, -26, 100, 9.5f, T.muted, FontStyleBold);
+            TextC(g, target, 0, -2, 100, 24, T.accentA, FontStyleBold);
+            TextC(g, g_filename.c_str(), 0, 26, 112, 10, T.muted);
+        } else if (g_selected >= 0) {
+            const std::wstring from = g_source + L"  \u2192";
+            TextC(g, from.c_str(), 0, -28, 100, 9.5f, T.muted, FontStyleBold);
+            TextC(g, target, 0, -4, 100, 25, T.accentA, FontStyleBold);
+            TextC(g, g_filename.c_str(), 0, 26, 112, 10, T.muted);
+        } else if (n > 0) {
+            TextC(g, L"CONVERT FROM", 0, -28, 100, 9.5f, T.muted, FontStyleBold);
+            TextC(g, g_source.c_str(), 0, -4, 100, 25, T.ink, FontStyleBold);
+            TextC(g, g_filename.c_str(), 0, 26, 112, 10, T.muted);
+        } else {
+            TextC(g, L"FLOWDROP", 0, -28, 100, 9.5f, T.accentA, FontStyleBold);
+            TextC(g, L"Drop", 0, -4, 100, 25, T.ink, FontStyleBold);
+            TextC(g, L"to convert", 0, 26, 100, 10, T.muted);
+        }
+    }
+
+    POINT dst = { g_winX, g_winY }, src = { 0, 0 };
+    SIZE size = { W, W };
+    BLENDFUNCTION blend = { AC_SRC_OVER, 0, static_cast<BYTE>(255.0f * Clamp(g_alpha, 0.f, 1.f)), AC_SRC_ALPHA };
+    UpdateLayeredWindow(g_window, nullptr, &dst, &size, g_memDC, &src, 0, &blend, ULW_ALPHA);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Animation
+// ---------------------------------------------------------------------------------------------
+static void Tick(float dt)
+{
+    g_alpha = Smooth(g_alpha, g_visible ? 1.0f : 0.0f, g_visible ? 16.0f : 20.0f, dt);
+
+    // spring for the "pop" scale (slight overshoot = alive feeling)
+    const float target = g_visible ? 1.0f : 0.92f;
+    const float k = 420.0f, c = 26.0f;
+    g_popVel += (k * (target - g_pop) - c * g_popVel) * dt;
+    g_pop += g_popVel * dt;
+
+    for (int i = 0; i < static_cast<int>(g_hoverAnim.size()); ++i)
+        g_hoverAnim[i] = Smooth(g_hoverAnim[i], i == g_selected ? 1.0f : 0.0f, 20.0f, dt);
+
+    g_pulse = Smooth(g_pulse, 0.0f, 9.0f, dt);
+    g_spin += dt * 430.0f;
+    if (g_spin > 360.f) g_spin -= 360.f;
+
+    const int n = static_cast<int>(g_items.size());
+    const bool has = g_selected >= 0 && n > 0;
+    g_knobAlpha = Smooth(g_knobAlpha, has ? 1.0f : 0.0f, 14.0f, dt);
+    if (has) {
+        const float tgt = -90.0f + g_selected * (360.0f / n);
+        if (g_knobAlpha < 0.05f) {
+            g_knob = tgt;                                    // appear exactly on the segment
+        } else {
+            float d = std::fmod(tgt - g_knob, 360.0f);       // glide along the shortest way round
+            if (d > 180.f) d -= 360.f;
+            if (d < -180.f) d += 360.f;
+            g_knob += d * (1.0f - std::exp(-18.0f * dt));
+        }
+    }
+
+    if ((g_phase == Phase::Success || g_phase == Phase::Failed) && Now() - g_phaseTime > 0.85) {
+        g_phase = Phase::Idle;
+        if (g_contextMode) g_quitPending = true;
+        HideCard(L"done");
+    }
+}
+
+static void FrameTick()
+{
+    const double now = Now();
+    const double elapsed = now - g_lastFrame;
+    if (elapsed < 1.0 / 90.0) return;
+    g_lastFrame = now;
+    Tick(static_cast<float>(std::min(elapsed, 0.05)));
+    if (!g_visible && g_alpha < 0.03f) { FinishHide(); return; }
+    RenderCard();
+}
+
+// ---------------------------------------------------------------------------------------------
+// OLE drop target
+// ---------------------------------------------------------------------------------------------
 static bool ExtractFiles(IDataObject* data, std::vector<std::wstring>& files)
 {
     FORMATETC format = { CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL };
     STGMEDIUM medium = {};
     if (FAILED(data->GetData(&format, &medium))) return false;
-
     HDROP drop = static_cast<HDROP>(GlobalLock(medium.hGlobal));
-    if (!drop) {
-        ReleaseStgMedium(&medium);
-        return false;
-    }
-    UINT count = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
+    if (!drop) { ReleaseStgMedium(&medium); return false; }
+    const UINT count = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
     for (UINT i = 0; i < count; ++i) {
         UINT length = DragQueryFileW(drop, i, nullptr, 0);
         std::wstring file(length + 1, L'\0');
@@ -330,602 +814,207 @@ static bool ExtractFiles(IDataObject* data, std::vector<std::wstring>& files)
     return !files.empty();
 }
 
-static std::wstring HubLabelForFile(const std::wstring& file)
-{
-    if (file.empty()) return L"CONVERT";
-    std::wstring name = PathFindFileNameW(file.c_str());
-    const size_t extension = name.find_last_of(L'.');
-    if (extension != std::wstring::npos) name.resize(extension);
-    if (name.empty()) return L"CONVERT";
-    // A concise, single line label remains readable in the 40 px hub.  The
-    // original filename stays available in the console drag log.
-    if (name.size() > 7) name = name.substr(0, 6) + L"…";
-    return name;
-}
-
-static const wchar_t* SourceFormatName(const std::wstring& file)
-{
-    const wchar_t* extension = PathFindExtensionW(file.c_str());
-    if (!extension) return L"FILE";
-    if (_wcsicmp(extension, L".jpg") == 0 || _wcsicmp(extension, L".jpeg") == 0) return L"JPEG";
-    if (_wcsicmp(extension, L".png") == 0) return L"PNG";
-    if (_wcsicmp(extension, L".gif") == 0) return L"GIF";
-    if (_wcsicmp(extension, L".bmp") == 0) return L"BMP";
-    if (_wcsicmp(extension, L".tif") == 0 || _wcsicmp(extension, L".tiff") == 0) return L"TIFF";
-    if (_wcsicmp(extension, L".webp") == 0) return L"WEBP";
-    if (_wcsicmp(extension, L".heic") == 0) return L"HEIC";
-    if (_wcsicmp(extension, L".avif") == 0) return L"AVIF";
-    if (_wcsicmp(extension, L".pdf") == 0) return L"PDF";
-    if (_wcsicmp(extension, L".docx") == 0) return L"DOCX";
-    if (_wcsicmp(extension, L".xlsx") == 0) return L"XLSX";
-    if (_wcsicmp(extension, L".pptx") == 0) return L"PPTX";
-    if (_wcsicmp(extension, L".txt") == 0) return L"TXT";
-    return L"FILE";
-}
-
-static void AddPetalPath(GraphicsPath& path, int index)
-{
-    const float centerAngle = -90.0f + index * 45.0f;
-    const float halfSweep = PETAL_SWEEP_DEGREES / 2.0f;
-    const float startAngle = centerAngle - halfSweep;
-    const float endAngle = centerAngle + halfSweep;
-    const float scale = WheelScale();
-    const float wheelSize = static_cast<float>(WheelSize());
-    const PointF center(wheelSize / 2.0f, wheelSize / 2.0f);
-    const float outer = WHEEL_RADIUS_96 * scale;
-    const float inner = PETAL_INNER_RADIUS_96 * scale;
-    const float radians = PI_F / 180.0f;
-    const auto pointAt = [&](float radius, float angle) {
-        return PointF(center.X + radius * std::cos(angle * radians),
-            center.Y + radius * std::sin(angle * radians));
-    };
-    const PointF innerStart = pointAt(inner, centerAngle - halfSweep * 0.62f);
-    const PointF outerStart = pointAt(outer - 1.0f * scale, startAngle);
-    const PointF outerEnd = pointAt(outer - 1.0f * scale, endAngle);
-    const PointF innerEnd = pointAt(inner, centerAngle + halfSweep * 0.62f);
-
-    path.StartFigure();
-    path.AddBezier(innerStart,
-        pointAt(inner + 10.0f * scale, centerAngle - halfSweep * 0.94f),
-        pointAt(outer - 19.0f * scale, centerAngle - halfSweep * 1.10f), outerStart);
-    path.AddBezier(outerStart,
-        pointAt(outer + 4.0f * scale, centerAngle - halfSweep * 0.60f),
-        pointAt(outer + 4.0f * scale, centerAngle + halfSweep * 0.60f), outerEnd);
-    path.AddBezier(outerEnd,
-        pointAt(outer - 19.0f * scale, centerAngle + halfSweep * 1.10f),
-        pointAt(inner + 10.0f * scale, centerAngle + halfSweep * 0.94f), innerEnd);
-    path.AddBezier(innerEnd,
-        pointAt(inner - 1.5f * scale, centerAngle + halfSweep * 0.35f),
-        pointAt(inner - 1.5f * scale, centerAngle - halfSweep * 0.35f), innerStart);
-    path.CloseFigure();
-}
-
-// One set of petal paths per DPI scale; painting and hit testing share it, so
-// the visible region and the selectable region cannot drift apart.
-static std::array<std::unique_ptr<GraphicsPath>, 8> g_petals;
-static float g_petalScale = 0.0f;
-
-static const GraphicsPath& Petal(int index)
-{
-    if (g_petalScale != g_scale) {
-        for (auto& p : g_petals) p.reset();
-        g_petalScale = g_scale;
-    }
-    if (!g_petals[index]) {
-        g_petals[index] = std::make_unique<GraphicsPath>();
-        AddPetalPath(*g_petals[index], index);
-    }
-    return *g_petals[index];
-}
-
-static bool IsSupportedImageFile(const std::wstring& file)
-{
-    const wchar_t* extension = PathFindExtensionW(file.c_str());
-    if (!extension) return false;
-    return _wcsicmp(extension, L".jpg") == 0 ||
-        _wcsicmp(extension, L".jpeg") == 0 ||
-        _wcsicmp(extension, L".png") == 0 ||
-        _wcsicmp(extension, L".bmp") == 0 ||
-        _wcsicmp(extension, L".gif") == 0 ||
-        _wcsicmp(extension, L".tif") == 0 ||
-        _wcsicmp(extension, L".tiff") == 0;
-}
-
-static void SetSupportedFormats(const std::wstring& file)
-{
-    for (bool& supported : g_supported) supported = false;
-    g_sourceFormatLabel = SourceFormatName(file);
-    const bool image = IsSupportedImageFile(file);
-    const bool document = IsDocumentFile(file);
-    if (!image && !document) return;
-    const bool libreOfficeAvailable = document && !FindLibreOffice().empty();
-    for (int i = 0; i < static_cast<int>(kFormats.size()); ++i) {
-        CLSID encoder;
-        const bool imageOutput = kFormats[i].mime[0] != L'\0';
-        const bool documentOutput = !imageOutput;
-        const bool available = image
-            ? imageOutput && EncoderClsid(kFormats[i].mime, &encoder) != 0
-            : documentOutput && libreOfficeAvailable;
-        g_supported[i] = available && !IsSameFormat(file, i);
-    }
-}
-
-static bool HasSupportedFormat()
-{
-    for (bool supported : g_supported) {
-        if (supported) return true;
-    }
-    return false;
-}
-
-// Before Explorer has entered our HWND there is no IDataObject to inspect.
-// Show only formats the installed native engine can actually encode, then
-// replace this provisional set as soon as DragEnter supplies the real file.
-static void SetProvisionalNativeFormats()
-{
-    for (bool& supported : g_supported) supported = false;
-    for (int i = 0; i < static_cast<int>(kFormats.size()); ++i) {
-        CLSID encoder;
-        g_supported[i] = (kFormats[i].mime[0] && EncoderClsid(kFormats[i].mime, &encoder) != 0) ||
-            (!kFormats[i].mime[0] && !FindLibreOffice().empty());
-    }
-    g_sourceFormatLabel = L"FILE";
-    g_dragLabel = L"CONVERT";
-}
-
-static int FormatAt(POINTL point)
-{
-    RECT rect;
-    GetWindowRect(g_window, &rect);
-    const PointF local(
-        static_cast<REAL>(point.x - rect.left),
-        static_cast<REAL>(point.y - rect.top));
-    for (int i = 0; i < 8; ++i) {
-        if (!g_supported[i]) continue;
-        if (Petal(i).IsVisible(local)) return i;
-    }
-    return -1;
-}
-
-// Returns true when the surface moved or was just shown.
-static bool PlaceWheel(POINTL point)
-{
-    const POINT cursor = { point.x, point.y };
-    HMONITOR hmon = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
-    MONITORINFO monitor = { sizeof(monitor) };
-    GetMonitorInfoW(hmon, &monitor);
-    UINT dpiX = 96, dpiY = 96;
-    if (SUCCEEDED(GetDpiForMonitor(hmon, MDT_EFFECTIVE_DPI, &dpiX, &dpiY))) {
-        g_scale = static_cast<float>(dpiX) / 96.0f;
-    }
-    const RECT& workArea = monitor.rcWork;
-    const int wheelSize = WheelSize();
-    // Keep the cursor in the hub; a native OLE target gets DragLeave if the
-    // window jumps away from the pointer.
-    const int desiredLeft = static_cast<int>(point.x) - wheelSize / 2;
-    const int desiredTop = static_cast<int>(point.y) - wheelSize / 2;
-    const int maxLeft = static_cast<int>(workArea.right) - wheelSize;
-    const int maxTop = static_cast<int>(workArea.bottom) - wheelSize;
-    const int left = desiredLeft < workArea.left ? workArea.left
-        : (desiredLeft > maxLeft ? maxLeft : desiredLeft);
-    const int top = desiredTop < workArea.top ? workArea.top
-        : (desiredTop > maxTop ? maxTop : desiredTop);
-
-    const bool wasVisible = IsWindowVisible(g_window) != FALSE;
-    if (wasVisible && left == g_left && top == g_top) return false;
-    if (!wasVisible) {
-        ResetAnimationState();
-        g_openStart = GetTickCount64();
-        StartAnimation();
-    }
-    g_left = left;
-    g_top = top;
-    SetWindowPos(g_window, HWND_TOPMOST, left, top, wheelSize, wheelSize,
-        SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    return true;
-}
-
-static void UpdateWheelFromInput()
-{
-    if (!g_window) return;
-    const bool dragging = g_leftButtonDown;
-    if (g_cancelled || (!dragging && !g_dragging) ||
-        (!g_shiftActivated && !g_dragging)) {
-        if (!dragging) g_oleInteractionObserved = false;
-        PostMessageW(g_window, WM_APP_HIDE_WHEEL, 0, 0);
-        return;
-    }
-    POINT cursor;
-    if (!g_dragging && dragging && g_shiftActivated && !g_oleInteractionObserved) {
-        SetProvisionalNativeFormats();
-    }
-    // Once OLE has entered, the wheel stays anchored so a petal can be reached.
-    if (!g_dragging && HasSupportedFormat() && GetCursorPos(&cursor)) {
-        PostMessageW(g_window, WM_APP_SHOW_WHEEL, static_cast<WPARAM>(cursor.x),
-            static_cast<LPARAM>(cursor.y));
-    }
-}
-
-static LRESULT CALLBACK LowLevelMouseProc(int code, WPARAM message, LPARAM data)
-{
-    if (code == HC_ACTION &&
-        (message == WM_MOUSEMOVE || message == WM_LBUTTONDOWN || message == WM_LBUTTONUP)) {
-        if (message == WM_LBUTTONDOWN) {
-            g_leftButtonDown = true;
-            g_shiftActivated = false;
-            g_oleInteractionObserved = false;
-            g_cancelled = false;
-        }
-        if (message == WM_LBUTTONUP) {
-            g_leftButtonDown = false;
-            g_shiftActivated = false;
-            g_cancelled = false;
-        }
-        UpdateWheelFromInput();
-    }
-    return CallNextHookEx(g_mouseHook, code, message, data);
-}
-
-static LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM message, LPARAM data)
-{
-    if (code == HC_ACTION && (message == WM_KEYDOWN || message == WM_SYSKEYDOWN ||
-        message == WM_KEYUP || message == WM_SYSKEYUP)) {
-        const auto* key = reinterpret_cast<KBDLLHOOKSTRUCT*>(data);
-        const bool down = message == WM_KEYDOWN || message == WM_SYSKEYDOWN;
-        if (key->vkCode == VK_SHIFT || key->vkCode == VK_LSHIFT || key->vkCode == VK_RSHIFT) {
-            g_shift = down;
-            if (down && g_leftButtonDown) g_shiftActivated = true;
-        }
-        // Escape cancels the wheel until the button is released.
-        if (key->vkCode == VK_ESCAPE && down && g_leftButtonDown) g_cancelled = true;
-        UpdateWheelFromInput();
-    }
-    return CallNextHookEx(g_keyboardHook, code, message, data);
-}
-
-static Color Mix(const Color& a, const Color& b, float t)
-{
-    const auto lerp = [&](BYTE x, BYTE y) {
-        return static_cast<BYTE>(std::lround(x + (y - x) * t));
-    };
-    return Color(lerp(a.GetA(), b.GetA()), lerp(a.GetR(), b.GetR()),
-        lerp(a.GetG(), b.GetG()), lerp(a.GetB(), b.GetB()));
-}
-
-static Color WithAlpha(const Color& c, BYTE alpha)
-{
-    return Color(alpha, c.GetR(), c.GetG(), c.GetB());
-}
-
-static void PaintWheel(Graphics& graphics, const Theme& theme, float openT)
-{
-    graphics.SetSmoothingMode(SmoothingModeAntiAlias);
-    graphics.SetPixelOffsetMode(PixelOffsetModeHighQuality);
-    graphics.SetCompositingQuality(CompositingQualityHighQuality);
-    // Grayscale AA: ClearType cannot be used on a per-pixel-alpha surface.
-    graphics.SetTextRenderingHint(TextRenderingHintAntiAlias);
-
-    const float scale = WheelScale();
-    const float wheelSize = static_cast<float>(WheelSize());
-    const float hubRadius = HUB_RADIUS_96 * scale;
-    const PointF center(wheelSize / 2.0f, wheelSize / 2.0f);
-
-    const float s = OPEN_START_SCALE + (1.0f - OPEN_START_SCALE) * openT;
-    graphics.TranslateTransform(center.X, center.Y);
-    graphics.ScaleTransform(s, s);
-    graphics.TranslateTransform(-center.X, -center.Y);
-
-    // Shadow lives only outside the silhouette so the translucent face stays
-    // clean and the desktop shows through undistorted.
-    GraphicsPath silhouette;
-    for (int i = 0; i < 8; ++i) AddPetalPath(silhouette, i);
-    GraphicsPath hubDisc;
-    hubDisc.AddEllipse(center.X - hubRadius, center.Y - hubRadius, hubRadius * 2, hubRadius * 2);
-    graphics.SetClip(&silhouette, CombineModeExclude);
-    graphics.TranslateTransform(0.0f, 3.0f * scale);
-    for (int k = 6; k >= 1; --k) {
-        Pen soft(WithAlpha(theme.shadow, static_cast<BYTE>(5 + (7 - k))), k * 2.4f * scale);
-        soft.SetLineJoin(LineJoinRound);
-        graphics.DrawPath(&soft, &silhouette);
-    }
-    graphics.TranslateTransform(0.0f, -3.0f * scale);
-    graphics.ResetClip();
-
-    Font font(L"Segoe UI", 9.5f * scale, FontStyleBold, UnitPixel);
-    StringFormat centered;
-    centered.SetAlignment(StringAlignmentCenter);
-    centered.SetLineAlignment(StringAlignmentCenter);
-
-    for (int i = 0; i < 8; ++i) {
-        const GraphicsPath& petal = Petal(i);
-        const float m = g_mix[i];
-        const Color base = g_supported[i] ? theme.face : theme.faceUnavailable;
-        Color fill = base;
-        if (g_supported[i] && m > 0.001f) {
-            fill = Mix(base, Color(244, 255, 150, 70), m);
-        }
-        SolidBrush brush(fill);
-        graphics.FillPath(&brush, &petal);
-        Pen border(Mix(theme.border, Color(190, 255, 190, 140), m), 1.0f * scale);
-        graphics.DrawPath(&border, &petal);
-
-        // Blank petals are structure only; just supported encoders get labels.
-        if (!g_supported[i]) continue;
-        const float angle = (-90.0f + i * 45.0f) * PI_F / 180.0f;
-        const float labelRadius = 53.0f * scale;
-        const PointF at(center.X + labelRadius * std::cos(angle),
-            center.Y + labelRadius * std::sin(angle));
-        SolidBrush text(Mix(theme.ink, theme.accentInk, m));
-        graphics.DrawString(FormatName(i), -1, &font,
-            RectF(at.X - 24.0f * scale, at.Y - 9.0f * scale, 48.0f * scale, 18.0f * scale),
-            &centered, &text);
-    }
-
-    // Hub: accent gradient disc with a hairline ring.
-    LinearGradientBrush hubBrush(
-        PointF(center.X, center.Y - hubRadius), PointF(center.X, center.Y + hubRadius),
-        theme.accentTop, theme.accentBottom);
-    graphics.FillPath(&hubBrush, &hubDisc);
-    Pen ring(Color(110, 255, 255, 255), 1.0f * scale);
-    graphics.DrawPath(&ring, &hubDisc);
-
-    Font fileFont(L"Segoe UI", 7.5f * scale, FontStyleBold, UnitPixel);
-    SolidBrush fileText(theme.accentInk);
-    std::wstring hubText = g_sourceFormatLabel == L"FILE"
-        ? L"CONVERT"
-        : g_sourceFormatLabel + L" \x2192";
-    graphics.DrawString(hubText.c_str(), -1, &fileFont,
-        RectF(center.X - hubRadius + 3.0f * scale, center.Y - 7.0f * scale,
-            hubRadius * 2.0f - 6.0f * scale, 14.0f * scale),
-        &centered, &fileText);
-}
-
-// Draws straight into the premultiplied-alpha DIB used by UpdateLayeredWindow,
-// so transparency is real per-pixel alpha, not a color key.
-static void RenderLayeredWheel()
-{
-    if (!g_window || !IsWindowVisible(g_window)) return;
-    const int size = WheelSize();
-    HDC screen = GetDC(nullptr);
-    HDC memory = CreateCompatibleDC(screen);
-    BITMAPINFO info = {};
-    info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    info.bmiHeader.biWidth = size;
-    info.bmiHeader.biHeight = -size;
-    info.bmiHeader.biPlanes = 1;
-    info.bmiHeader.biBitCount = 32;
-    info.bmiHeader.biCompression = BI_RGB;
-    void* pixels = nullptr;
-    HBITMAP bitmap = CreateDIBSection(screen, &info, DIB_RGB_COLORS, &pixels, nullptr, 0);
-    if (!memory || !bitmap || !pixels) {
-        if (bitmap) DeleteObject(bitmap);
-        if (memory) DeleteDC(memory);
-        if (screen) ReleaseDC(nullptr, screen);
-        return;
-    }
-    HGDIOBJ oldBitmap = SelectObject(memory, bitmap);
-    ZeroMemory(pixels, static_cast<size_t>(size) * size * 4);
-    const float openT = OpenProgress();
-    {
-        Bitmap surface(size, size, size * 4, PixelFormat32bppPARGB, static_cast<BYTE*>(pixels));
-        Graphics graphics(&surface);
-        PaintWheel(graphics, CurrentTheme(), openT);
-    }
-
-    RECT rect;
-    GetWindowRect(g_window, &rect);
-    POINT destination = { rect.left, rect.top };
-    POINT source = { 0, 0 };
-    SIZE surfaceSize = { size, size };
-    BLENDFUNCTION blend = { AC_SRC_OVER, 0, static_cast<BYTE>(std::lround(255.0f * openT)), AC_SRC_ALPHA };
-    UpdateLayeredWindow(g_window, screen, &destination, &surfaceSize, memory,
-        &source, 0, &blend, ULW_ALPHA);
-    SelectObject(memory, oldBitmap);
-    DeleteObject(bitmap);
-    DeleteDC(memory);
-    ReleaseDC(nullptr, screen);
-}
-
-// Advances open and hover easing. Returns true while anything still moves.
-static bool TickAnimation()
-{
-    bool active = OpenProgress() < 1.0f;
-    for (int i = 0; i < 8; ++i) {
-        const float target = (i == g_hover && g_supported[i]) ? 1.0f : 0.0f;
-        const float delta = target - g_mix[i];
-        if (std::fabs(delta) > 0.01f) {
-            g_mix[i] += delta * HOVER_EASE;
-            active = true;
-        } else {
-            g_mix[i] = target;
-        }
-    }
-    return active;
-}
-
 class DropTarget final : public IDropTarget {
     ULONG references_ = 1;
     IDataObject* data_ = nullptr;
 
+    void ReleaseData() { if (data_) { data_->Release(); data_ = nullptr; } }
 public:
-    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** object) override
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID id, void** object) override
     {
         if (!object) return E_POINTER;
         *object = nullptr;
-        if (iid == IID_IUnknown || iid == IID_IDropTarget) {
-            *object = static_cast<IDropTarget*>(this);
-            AddRef();
-            return S_OK;
+        if (id == IID_IUnknown || id == IID_IDropTarget) {
+            *object = static_cast<IDropTarget*>(this); AddRef(); return S_OK;
         }
         return E_NOINTERFACE;
     }
     ULONG STDMETHODCALLTYPE AddRef() override { return ++references_; }
-    ULONG STDMETHODCALLTYPE Release() override
-    {
-        ULONG result = --references_;
-        if (!result) delete this;
-        return result;
-    }
+    ULONG STDMETHODCALLTYPE Release() override { ULONG r = --references_; if (!r) delete this; return r; }
+
     HRESULT STDMETHODCALLTYPE DragEnter(IDataObject* data, DWORD keys, POINTL point, DWORD* effect) override
     {
         if (!effect) return E_INVALIDARG;
-        g_oleInteractionObserved = true;
+        *effect = DROPEFFECT_NONE;
         g_shift = (keys & MK_SHIFT) != 0;
-        if (!g_shiftActivated && !g_shift) {
-            Log(L"DragEnter ignored: Shift activation required");
-            g_oleInteractionObserved = false;
-            HideWheel(L"Shift required");
-            *effect = DROPEFFECT_NONE;
-            return S_OK;
-        }
-        if (data_) data_->Release();
-        data_ = data;
-        data_->AddRef();
-        g_files.clear();
-        ExtractFiles(data, g_files);
-        g_dragLabel = g_files.empty() ? L"CONVERT" : HubLabelForFile(g_files.front());
-        SetSupportedFormats(g_files.empty() ? L"" : g_files.front());
-        if (!HasSupportedFormat()) {
-            Log(L"No native conversion formats available for %s", g_dragLabel.c_str());
-            g_dragging = false;
-            HideWheel(L"unsupported input");
-            *effect = DROPEFFECT_NONE;
-            return S_OK;
-        }
-        Log(L"Conversion options ready for %s (JPEG=%d BMP=%d TIFF=%d)",
-            g_sourceFormatLabel.c_str(), g_supported[1], g_supported[5], g_supported[7]);
+        if (g_phase != Phase::Idle) return S_OK;
+        if (!g_shift && !g_shiftConfirmed) { HideCard(L"shift required"); return S_OK; }
+
+        ReleaseData();
+        data_ = data; data_->AddRef();
+        std::vector<std::wstring> files;
+        if (!ExtractFiles(data, files)) return S_OK;
+        SetFile(files.front());
+        if (g_items.empty()) { HideCard(L"unsupported input"); return S_OK; }
+
         g_dragging = true;
-        PlaceWheel(point);
-        SetHover(FormatAt(point));
-        *effect = g_hover >= 0 ? DROPEFFECT_COPY : DROPEFFECT_NONE;
-        RenderLayeredWheel();
+        const POINT p = { point.x, point.y };
+        if (!g_visible) PlaceCard(p);
+        SelectFromPoint(p);
+        *effect = g_selected >= 0 ? DROPEFFECT_COPY : DROPEFFECT_NONE;
         return S_OK;
     }
+
     HRESULT STDMETHODCALLTYPE DragOver(DWORD keys, POINTL point, DWORD* effect) override
     {
         if (!effect) return E_INVALIDARG;
         g_shift = (keys & MK_SHIFT) != 0;
-        if (!g_shiftActivated && !g_shift) {
-            *effect = DROPEFFECT_NONE;
-            return S_OK;
-        }
-        const int hover = FormatAt(point);
-        if (hover != g_hover) {
-            SetHover(hover);
-            RenderLayeredWheel();
-        }
-        *effect = g_hover >= 0 ? DROPEFFECT_COPY : DROPEFFECT_NONE;
+        if (!g_dragging || (!g_shift && !g_shiftConfirmed)) { *effect = DROPEFFECT_NONE; return S_OK; }
+        SelectFromPoint({ point.x, point.y });
+        *effect = g_selected >= 0 ? DROPEFFECT_COPY : DROPEFFECT_NONE;
         return S_OK;
     }
+
     HRESULT STDMETHODCALLTYPE DragLeave() override
     {
-        Log(L"DragLeave");
-        if (data_) {
-            data_->Release();
-            data_ = nullptr;
-        }
+        ReleaseData();
         g_dragging = false;
-        for (bool& supported : g_supported) supported = false;
-        g_sourceFormatLabel = L"FILE";
-        g_dragLabel = L"CONVERT";
-        HideWheel(L"DragLeave");
+        HideCard(L"drag left");
         return S_OK;
     }
+
     HRESULT STDMETHODCALLTYPE Drop(IDataObject* data, DWORD keys, POINTL point, DWORD* effect) override
     {
         if (!effect) return E_INVALIDARG;
         g_shift = (keys & MK_SHIFT) != 0;
-        const int selected = g_cancelled ? -1 : FormatAt(point);
-        g_hover = selected;
+        SelectFromPoint({ point.x, point.y });
+        const int selected = g_cancelled ? -1 : g_selected;
+
         std::vector<std::wstring> files;
-        bool extracted = ExtractFiles(data, files);
-        Log(L"Drop shift=%d hover=%d files=%zu", g_shift, g_hover, files.size());
-        if (extracted && selected >= 0) {
-            Log(L"Conversion selected: %s", FormatName(selected));
-            bool convertedAll = true;
-            for (const auto& file : files) {
-                const bool convertible = IsSupportedImageFile(file) || IsDocumentFile(file);
-                const bool converted = convertible && ConvertFile(file, selected);
-                convertedAll = convertedAll && converted;
-                Log(L"  %s | Output: %s | Status: %s", file.c_str(), FormatName(selected),
-                    converted ? L"Converted successfully"
-                              : (convertible ? L"Conversion failed" : L"Unsupported input format"));
-            }
-            *effect = convertedAll ? DROPEFFECT_COPY : DROPEFFECT_NONE;
+        bool ok = ExtractFiles(data, files) && selected >= 0 && selected < static_cast<int>(g_items.size())
+            && g_phase == Phase::Idle;
+        if (ok) for (const auto& f : files) if (!(IsImage(f) || IsDocument(f))) ok = false;
+
+        ReleaseData();
+        g_dragging = false;
+        if (ok) {
+            *effect = DROPEFFECT_COPY;
+            StartConversion(std::move(files), g_items[selected]);   // returns immediately
         } else {
             *effect = DROPEFFECT_NONE;
+            HideCard(L"drop cancelled");
         }
-        if (data_) {
-            data_->Release();
-            data_ = nullptr;
-        }
-        g_dragging = false;
-        for (bool& supported : g_supported) supported = false;
-        g_sourceFormatLabel = L"FILE";
-        HideWheel(selected >= 0 ? L"drop completed" : L"drop outside petal");
         return S_OK;
     }
 };
 
+// ---------------------------------------------------------------------------------------------
+// Input hooks
+// ---------------------------------------------------------------------------------------------
+static void TriggerCheck(POINT p)
+{
+    if (g_contextMode || !g_leftDown || g_cancelled || !g_shiftConfirmed ||
+        g_visible || g_dragging || g_phase != Phase::Idle) return;
+    const int thr = GetSystemMetrics(SM_CXDRAG) + 2;
+    const int dx = p.x - g_downPt.x, dy = p.y - g_downPt.y;
+    if (dx * dx + dy * dy > thr * thr)
+        PostMessageW(g_window, WM_APP_SHOW_CARD, static_cast<WPARAM>(static_cast<LONG_PTR>(p.x)),
+            static_cast<LPARAM>(p.y));
+}
+
+static void ConfirmContext()
+{
+    if (g_selected < 0 || g_selected >= static_cast<int>(g_items.size())) {
+        PostQuitMessage(0);
+        return;
+    }
+    StartConversion(g_files, g_items[g_selected]);
+}
+
+static LRESULT CALLBACK MouseHook(int code, WPARAM message, LPARAM data)
+{
+    if (code == HC_ACTION) {
+        const auto* ms = reinterpret_cast<const MSLLHOOKSTRUCT*>(data);
+        if (message == WM_MOUSEWHEEL) {
+            if (g_visible && (g_dragging || g_contextMode) && g_phase == Phase::Idle && !g_items.empty()) {
+                g_wheelAccum += static_cast<short>(HIWORD(ms->mouseData));
+                const int steps = g_wheelAccum / WHEEL_DELTA;
+                if (steps) {
+                    g_wheelAccum -= steps * WHEEL_DELTA;
+                    StepSelection(-steps);                    // scroll down = clockwise
+                }
+                return 1;                                     // keep the page underneath from scrolling
+            }
+        } else if (g_contextMode) {
+            if (g_visible && g_phase == Phase::Idle) {
+                if (message == WM_MOUSEMOVE) {
+                    SelectFromPoint(ms->pt);
+                } else if (message == WM_LBUTTONUP && Now() - g_startTime > 0.35) {
+                    SelectFromPoint(ms->pt);
+                    ConfirmContext();
+                }
+            }
+        } else {
+            if (message == WM_LBUTTONDOWN) {
+                g_leftDown = true;
+                g_cancelled = false;
+                g_downPt = ms->pt;
+                g_shiftConfirmed = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+            } else if (message == WM_LBUTTONUP) {
+                g_leftDown = false;
+                g_shiftConfirmed = false;
+                PostMessageW(g_window, WM_APP_HIDE_CARD, 0, 0);
+            } else if (message == WM_MOUSEMOVE) {
+                TriggerCheck(ms->pt);
+            }
+        }
+    }
+    return CallNextHookEx(g_mouseHook, code, message, data);
+}
+
+static LRESULT CALLBACK KeyboardHook(int code, WPARAM message, LPARAM data)
+{
+    if (code == HC_ACTION && (message == WM_KEYDOWN || message == WM_SYSKEYDOWN ||
+        message == WM_KEYUP || message == WM_SYSKEYUP)) {
+        const auto* key = reinterpret_cast<const KBDLLHOOKSTRUCT*>(data);
+        const bool down = message == WM_KEYDOWN || message == WM_SYSKEYDOWN;
+
+        if (key->vkCode == VK_SHIFT || key->vkCode == VK_LSHIFT || key->vkCode == VK_RSHIFT) {
+            g_shift = down;
+            if (down && g_leftDown && !g_contextMode) {
+                g_shiftConfirmed = true;
+                POINT cursor;
+                if (GetCursorPos(&cursor)) TriggerCheck(cursor);
+            }
+        }
+        if (key->vkCode == VK_ESCAPE && down) {
+            if (g_contextMode) { if (g_phase == Phase::Idle) PostQuitMessage(0); }
+            else if (g_leftDown) {
+                g_cancelled = true;
+                PostMessageW(g_window, WM_APP_HIDE_CARD, 0, 0);
+            }
+        }
+        if (g_contextMode && g_visible && g_phase == Phase::Idle && down) {
+            switch (key->vkCode) {
+            case VK_LEFT: case VK_UP:    StepSelection(-1); return 1;
+            case VK_RIGHT: case VK_DOWN: StepSelection(+1); return 1;
+            case VK_RETURN:              ConfirmContext();  return 1;
+            }
+        }
+    }
+    return CallNextHookEx(g_keyboardHook, code, message, data);
+}
+
 static LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam)
 {
-    if (message == WM_APP_SHOW_WHEEL) {
-        if (!g_shiftActivated && !g_dragging) {
-            HideWheel(L"activation not confirmed");
-            return 0;
-        }
-        POINTL point = { static_cast<LONG>(wParam), static_cast<LONG>(lParam) };
-        const bool wasVisible = IsWindowVisible(window) != FALSE;
-        if (PlaceWheel(point)) {
-            if (!wasVisible) Log(L"Wheel shown x=%ld y=%ld", point.x, point.y);
-            RenderLayeredWheel();
+    switch (message) {
+    case WM_APP_SHOW_CARD:
+        if (g_leftDown && !g_visible && g_phase == Phase::Idle) {
+            PlaceCard({ static_cast<LONG>(static_cast<LONG_PTR>(wParam)), static_cast<LONG>(lParam) });
+            RenderCard();
         }
         return 0;
-    }
-    if (message == WM_APP_HIDE_WHEEL && !g_dragging) {
-        const bool dragging = g_leftButtonDown;
-        if (g_cancelled) HideWheel(L"cancelled");
-        else if (!dragging) HideWheel(L"left button released");
-        else if (!g_shiftActivated) HideWheel(L"Shift required");
+    case WM_APP_HIDE_CARD:
+        if (!g_dragging && g_phase == Phase::Idle) HideCard(L"input ended");
         return 0;
-    }
-    if (message == WM_TIMER) {
-        if (wParam == TIMER_ANIM) {
-            if (!IsWindowVisible(window)) { KillTimer(window, TIMER_ANIM); return 0; }
-            const bool active = TickAnimation();
-            RenderLayeredWheel();
-            if (!active) KillTimer(window, TIMER_ANIM);
-        } else {
-            UpdateWheelFromInput();
-        }
+    case WM_APP_DONE:
+        g_phase = wParam ? Phase::Success : Phase::Failed;
+        g_phaseTime = Now();
+        g_pulse = 1.0f;
         return 0;
-    }
-    if (message == WM_DPICHANGED) return 0;
-    if (message == WM_NCHITTEST) {
-        POINT cursor;
-        GetCursorPos(&cursor);
-        RECT rect;
-        GetWindowRect(window, &rect);
-        const PointF local(static_cast<REAL>(cursor.x - rect.left),
-            static_cast<REAL>(cursor.y - rect.top));
-        const float hubRadius = HUB_RADIUS_96 * WheelScale();
-        const float center = WheelSize() / 2.0f;
-        const float x = local.X - center;
-        const float y = local.Y - center;
-        if (x * x + y * y <= hubRadius * hubRadius) return HTCLIENT;
-        for (int i = 0; i < 8; ++i) {
-            if (!g_supported[i]) continue;
-            if (Petal(i).IsVisible(local)) return HTCLIENT;
-        }
-        return HTTRANSPARENT;
-    }
-    if (message == WM_PAINT) {
-        PAINTSTRUCT paint;
-        BeginPaint(window, &paint);
-        EndPaint(window, &paint);
-        return 0;
-    }
-    if (message == WM_DESTROY) {
+    case WM_NCHITTEST:   return HTCLIENT;
+    case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
+    case WM_DESTROY:
         RevokeDragDrop(window);
         PostQuitMessage(0);
         return 0;
@@ -933,67 +1022,90 @@ static LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPA
     return DefWindowProcW(window, message, wParam, lParam);
 }
 
+// ---------------------------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------------------------
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
 {
     g_verbose = wcsstr(GetCommandLineW(), L"--console") != nullptr;
-    if (g_verbose) {
-        AllocConsole();
-        freopen("CONOUT$", "w", stdout);
-        Log(L"FlowDrop OLE drop-target POC (verbose)");
+
+    const std::wstring commandLine = GetCommandLineW();
+    const std::wstring contextToken = L"--context-file=\"";
+    const size_t contextStart = commandLine.find(contextToken);
+    if (contextStart != std::wstring::npos) {
+        const size_t valueStart = contextStart + contextToken.size();
+        const size_t valueEnd = commandLine.find(L'"', valueStart);
+        if (valueEnd != std::wstring::npos) {
+            g_contextMode = true;
+            g_files.push_back(commandLine.substr(valueStart, valueEnd - valueStart));
+        }
     }
-    wchar_t executablePath[MAX_PATH] = {};
-    GetModuleFileNameW(nullptr, executablePath, ARRAYSIZE(executablePath));
-    g_previewMode = wcsstr(GetCommandLineW(), L"--preview-wheel") != nullptr ||
-        wcsstr(executablePath, L".preview.exe") != nullptr;
 
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    timeBeginPeriod(1);
     OleInitialize(nullptr);
     GdiplusStartupInput startup;
     GdiplusStartup(&g_gdiplusToken, &startup, nullptr);
 
+    g_fontFamily = new FontFamily(L"Segoe UI Variable Display");
+    if (!g_fontFamily->IsAvailable()) { delete g_fontFamily; g_fontFamily = new FontFamily(L"Segoe UI"); }
+
+    int exitCode = 0;
     WNDCLASSW windowClass = {};
     windowClass.hInstance = instance;
     windowClass.lpfnWndProc = WindowProc;
-    windowClass.lpszClassName = L"FlowDropOlePoc";
+    windowClass.lpszClassName = L"FlowDropQuickConvert";
     windowClass.hCursor = LoadCursor(nullptr, IDC_ARROW);
     RegisterClassW(&windowClass);
 
     g_window = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_NOACTIVATE,
-        windowClass.lpszClassName, L"FlowDrop OLE POC", WS_POPUP,
-        500, 300, WHEEL_SIZE_96, WHEEL_SIZE_96, nullptr, nullptr, instance, nullptr);
+        windowClass.lpszClassName, L"FlowDrop Quick Convert", WS_POPUP,
+        0, 0, 100, 100, nullptr, nullptr, instance, nullptr);
     ShowWindow(g_window, SW_HIDE);
-    if (!g_previewMode) SetTimer(g_window, TIMER_INPUT, 50, nullptr);
-    UpdateWindow(g_window);
 
     auto* target = new DropTarget();
-    HRESULT registered = RegisterDragDrop(g_window, target);
-    Log(L"RegisterDragDrop: 0x%08X", registered);
+    const HRESULT registered = RegisterDragDrop(g_window, target);
     target->Release();
-    if (FAILED(registered)) return 1;
+    if (FAILED(registered)) exitCode = 1;
 
-    if (g_previewMode) {
-        SetProvisionalNativeFormats();
-        g_dragLabel = L"SUNSET";
-        POINT cursor;
-        GetCursorPos(&cursor);
-        PlaceWheel({ cursor.x, cursor.y });
-        RenderLayeredWheel();
-        Log(L"Preview wheel shown. Close the process to exit preview mode.");
-    } else {
-        g_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, LowLevelMouseProc, nullptr, 0);
-        g_keyboardHook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc, nullptr, 0);
-        Log(L"Input observers: mouse=%s keyboard=%s", g_mouseHook ? L"OK" : L"FAILED",
-            g_keyboardHook ? L"OK" : L"FAILED");
+    if (!exitCode && g_contextMode) {
+        SetFile(g_files.front());
+        if (g_items.empty()) exitCode = 2;
     }
 
-    MSG message;
-    while (GetMessageW(&message, nullptr, 0, 0) > 0) {
-        TranslateMessage(&message);
-        DispatchMessageW(&message);
+    if (!exitCode) {
+        g_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, MouseHook, nullptr, 0);
+        g_keyboardHook = SetWindowsHookExW(WH_KEYBOARD_LL, KeyboardHook, nullptr, 0);
+
+        if (g_contextMode) {
+            POINT cursor;
+            GetCursorPos(&cursor);
+            g_startTime = Now();
+            PlaceCard(cursor);
+            g_itemsStart = Now();
+            RenderCard();
+        }
+
+        MSG msg;
+        bool running = true;
+        while (running) {
+            MsgWaitForMultipleObjects(0, nullptr, FALSE, g_shown ? 4 : INFINITE, QS_ALLINPUT);
+            while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+                if (msg.message == WM_QUIT) { running = false; break; }
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+            if (running && g_shown) FrameTick();
+        }
     }
+
     if (g_mouseHook) UnhookWindowsHookEx(g_mouseHook);
     if (g_keyboardHook) UnhookWindowsHookEx(g_keyboardHook);
+    if (g_dib) { SelectObject(g_memDC, g_oldBmp); DeleteObject(g_dib); }
+    if (g_memDC) DeleteDC(g_memDC);
+    delete g_fontFamily;
     GdiplusShutdown(g_gdiplusToken);
     OleUninitialize();
-    return 0;
+    timeEndPeriod(1);
+    return exitCode;
 }

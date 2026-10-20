@@ -1,0 +1,6 @@
+LIBRARY FlowDropContextMenu
+EXPORTS
+    DllCanUnloadNow
+    DllGetClassObject
+    DllRegisterServer
+    DllUnregisterServer
