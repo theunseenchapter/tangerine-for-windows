@@ -1,0 +1,44 @@
+{
+  "name": "flowdrop-windows",
+  "version": "0.1.0",
+  "description": "Local-first Windows file conversion prototype inspired by zero-click converters",
+  "main": "src/main.js",
+  "scripts": {
+    "start": "C:\\PROGRA~1\\nodejs\\node.exe node_modules/electron/cli.js .",
+    "dev": "electron .",
+    "dist": "electron-builder --win nsis"
+  },
+  "keywords": [
+    "offline",
+    "file-converter",
+    "windows"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "electron": "^38.8.6",
+    "electron-builder": "^26.0.12"
+  },
+  "dependencies": {
+    "sharp": "^0.34.4"
+  },
+  "build": {
+    "appId": "com.flowdrop.windows",
+    "productName": "FlowDrop",
+    "win": {
+      "target": [
+        "nsis"
+      ]
+    },
+    "nsis": {
+      "include": "build/installer.nsh"
+    },
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "src/**/*",
+      "package.json",
+      "node_modules/sharp/**/*"
+    ]
+  }
+}
